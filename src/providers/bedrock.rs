@@ -2,32 +2,26 @@ use super::Provider;
 use crate::error::AppError;
 use async_trait::async_trait;
 use aws_event_stream_parser::{parse_message, Message};
-use aws_sigv4::http_request::{sign, SigningSettings, SigningParams};
-use aws_sigv4::sign::v4;
 use axum::{
     body::{Body, Bytes},
     http::{HeaderMap, HeaderValue, Response, StatusCode},
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use futures_util::StreamExt;
-use http::Request;
 use parking_lot::RwLock;
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::sync::Arc;
-use time::OffsetDateTime;
 use tracing::{debug, error, warn};
 
 const DEFAULT_REGION: &str = "us-east-1";
 const DEFAULT_MODEL: &str = "amazon.titan-text-express-v1";
-const DEFAULT_FALLBACK_MODEL: &str = "anthropic.claude-v2";
 const DEFAULT_MAX_TOKENS: u64 = 1000;
 const DEFAULT_TEMPERATURE: f64 = 0.7;
 const DEFAULT_TOP_P: f64 = 1.0;
 const MAX_IMAGE_SIZE: usize = 5_242_880; // 5MB
 const SUPPORTED_IMAGE_FORMATS: [&str; 4] = ["image/jpeg", "image/png", "image/gif", "image/webp"];
 const MAX_TOOL_CALLS: usize = 15;
-const SUPPORTED_TOOL_TYPES: [&str; 1] = ["function"];
 
 #[derive(Clone)]
 pub struct BedrockProvider {
@@ -110,11 +104,6 @@ impl BedrockProvider {
                 .iter()
                 .take(MAX_TOOL_CALLS)
                 .filter_map(|call| {
-                    let call_type = call.get("type")?.as_str()?;
-                    if !SUPPORTED_TOOL_TYPES.contains(&call_type) {
-                        return None;
-                    }
-
                     let function = call.get("function")?;
                     Some(json!({
                         "type": "function",
@@ -139,14 +128,7 @@ impl BedrockProvider {
         }
     }
 
-    fn get_model_name(&self, path: &str) -> String {
-        path.split('/')
-            .last()
-            .map(ToString::to_string)
-            .unwrap_or_else(|| DEFAULT_FALLBACK_MODEL.to_string())
-    }
-
-    fn transform_request_body(&self, body: Value) -> Result<Value, AppError> {
+    async fn transform_request_body(&self, body: Value) -> Result<Value, AppError> {
         debug!("Transforming request body: {:#?}", body);
 
         if body.get("inferenceConfig").is_some() {
@@ -163,73 +145,89 @@ impl BedrockProvider {
 
         let mut transformed_messages = Vec::new();
         for msg in messages {
-            let role = msg["role"].as_str().unwrap_or("user");
-            let content = msg.get("content");
+            let role = match msg.get("role").and_then(Value::as_str) {
+                Some("user") => "user",
+                Some("assistant") => "assistant",
+                Some("system") => "system",
+                _ => continue,
+            };
 
-            let transformed_content = match content {
-                Some(content_value) => {
-                    if content_value.is_array() {
-                        content_value
-                            .as_array()
-                            .unwrap()
-                            .iter()
-                            .map(|block| {
-                                match block.get("type").and_then(Value::as_str) {
-                                    Some("text") => json!({
-                                        "type": "text",
-                                        "text": block.get("text").and_then(Value::as_str).unwrap_or_default()
-                                    }),
-                                    Some("image_url") => {
-                                        if let Some(url) = block
-                                            .get("image_url")
-                                            .and_then(|u| u.get("url"))
-                                            .and_then(Value::as_str)
-                                        {
-                                            let media_type = block
-                                                .get("image_url")
-                                                .and_then(|u| u.get("detail"))
-                                                .and_then(Value::as_str)
-                                                .unwrap_or("auto");
-                                            
-                                            match self.process_image_content(url) {
-                                                Ok(base64_data) => json!({
-                                                    "type": "image",
-                                                    "source": {
-                                                        "type": "base64",
-                                                        "media_type": media_type,
-                                                        "data": base64_data
-                                                    }
-                                                }),
-                                                Err(e) => {
-                                                    error!("Failed to process image content: {}", e);
-                                                    json!({"type": "text", "text": ""})
-                                                }
-                                            }
-                                        } else {
-                                            json!({"type": "text", "text": ""})
-                                        }
+            let content = match msg.get("content") {
+                Some(content_value) if content_value.is_array() => {
+                    let mut text_content = String::new();
+                    let mut image_content = Vec::new();
+
+                    for block in content_value.as_array().unwrap() {
+                        match block.get("type").and_then(Value::as_str) {
+                            Some("text") => {
+                                if let Some(text) = block.get("text").and_then(Value::as_str) {
+                                    if !text_content.is_empty() {
+                                        text_content.push('\n');
                                     }
-                                    Some("tool_call") => self.transform_tool_calls(block)
-                                        .unwrap_or_else(|_| json!({"type": "text", "text": ""})),
-                                    _ => json!({"type": "text", "text": ""})
+                                    text_content.push_str(text);
                                 }
-                            })
-                            .collect::<Vec<_>>()
-                    } else if content_value.is_string() {
+                            }
+                            Some("image_url") => {
+                                if let Some(url) = block
+                                    .get("image_url")
+                                    .and_then(|u| u.get("url"))
+                                    .and_then(Value::as_str)
+                                {
+                                    let media_type = block
+                                        .get("image_url")
+                                        .and_then(|u| u.get("detail"))
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("auto");
+
+                                    image_content.push(json!({
+                                        "type": "image",
+                                        "source": {
+                                            "type": "base64",
+                                            "media_type": media_type,
+                                            "data": self.process_image_content(url).await?
+                                        }
+                                    }));
+                                }
+                            }
+                            Some("tool_call") => {
+                                if let Ok(tool_call) = self.transform_tool_calls(block) {
+                                    text_content.push_str(&serde_json::to_string(&tool_call)?);
+                                }
+                            }
+                            _ => continue,
+                        }
+                    }
+
+                    let mut content = Vec::new();
+                    if !text_content.is_empty() {
+                        content.push(json!({
+                            "type": "text",
+                            "text": text_content
+                        }));
+                    }
+                    content.extend(image_content);
+                    
+                    if content.is_empty() {
                         vec![json!({
                             "type": "text",
-                            "text": content_value.as_str().unwrap_or_default()
+                            "text": " " // Provide a non-empty default
                         })]
                     } else {
-                        vec![json!({"type": "text", "text": ""})]
+                        content
                     }
                 }
-                None => vec![json!({"type": "text", "text": ""})],
+                Some(content_value) if content_value.is_string() => {
+                    vec![json!({
+                        "type": "text",
+                        "text": content_value.as_str().unwrap_or_default()
+                    })]
+                }
+                _ => continue,
             };
 
             transformed_messages.push(json!({
                 "role": role,
-                "content": transformed_content
+                "content": content
             }));
         }
 
@@ -385,33 +383,6 @@ impl BedrockProvider {
             "usage": usage
         })
     }
-
-    async fn sign_request(&self, mut request: Request<Bytes>, credentials: (String, String, String)) -> Result<Request<Bytes>, AppError> {
-        let (access_key, secret_key, region) = credentials;
-        
-        let signing_settings = SigningSettings::default();
-        let signing_params = SigningParams::builder()
-            .access_key(access_key)
-            .secret_key(secret_key)
-            .region(region)
-            .service_name("bedrock")
-            .time(OffsetDateTime::now_utc())
-            .settings(signing_settings)
-            .build()
-            .map_err(|e| AppError::SigningError(e.to_string()))?;
-
-        let (signing_instructions, _signature) = v4::sign(request.clone(), &signing_params)
-            .map_err(|e| AppError::SigningError(e.to_string()))?;
-
-        for (key, value) in signing_instructions.headers {
-            request.headers_mut().insert(
-                key.clone(),
-                HeaderValue::from_str(&value).map_err(|e| AppError::SigningError(e.to_string()))?,
-            );
-        }
-
-        Ok(request)
-    }
 }
 
 #[async_trait]
@@ -422,6 +393,20 @@ impl Provider for BedrockProvider {
 
     fn name(&self) -> &str {
         "bedrock"
+    }
+
+    fn process_headers(&self, headers: &HeaderMap) -> Result<HeaderMap, AppError> {
+        // Pass through the headers as-is, since signing will be handled elsewhere
+        Ok(headers.clone())
+    }
+
+    async fn prepare_request_body(&self, body: Bytes) -> Result<Bytes, AppError> {
+        if let Ok(json_body) = serde_json::from_slice::<Value>(&body) {
+            let transformed_body = self.transform_request_body(json_body).await?;
+            Ok(Bytes::from(transformed_body.to_string()))
+        } else {
+            Ok(body)
+        }
     }
 
     async fn before_request(&self, headers: &HeaderMap, body: &Bytes) -> Result<(), AppError> {
@@ -451,33 +436,18 @@ impl Provider for BedrockProvider {
     }
 
     fn requires_signing(&self) -> bool {
-        true
+        false // AWS signing will be handled elsewhere
     }
 
-    fn get_signing_credentials(&self, headers: &HeaderMap) -> Option<(String, String, String)> {
-        let access_key = headers.get("x-aws-access-key-id")?.to_str().ok()?;
-        let secret_key = headers.get("x-aws-secret-access-key")?.to_str().ok()?;
-        let region = headers
-            .get("x-aws-region")
-            .and_then(|h| h.to_str().ok())
-            .map(String::from)
-            .unwrap_or_else(|| self.region.read().clone());
-
-        Some((access_key.to_string(), secret_key.to_string(), region))
-    }
-
-    fn get_signing_host(&self) -> String {
-        let region = self.region.read().clone();
-        format!("bedrock-runtime.{}.amazonaws.com", region)
-    }
-
-    async fn transform_request(&self, mut request: Request<Bytes>) -> Result<Request<Bytes>, AppError> {
-        let body = request.body();
-        if let Ok(json_body) = serde_json::from_slice::<Value>(body) {
-            let transformed_body = self.transform_request_body(json_body)?;
-            *request.body_mut() = Bytes::from(transformed_body.to_string());
-        }
-        Ok(request)
+    async fn sign_request(
+        &self,
+        _method: &str,
+        _url: &str,
+        headers: &HeaderMap,
+        _body: &[u8],
+    ) -> Result<HeaderMap, AppError> {
+        // Just pass through the headers as-is
+        Ok(headers.clone())
     }
 
     async fn process_response(&self, response: Response<Body>) -> Result<Response<Body>, AppError> {

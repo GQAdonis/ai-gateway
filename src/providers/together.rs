@@ -3,19 +3,20 @@ use crate::error::AppError;
 use async_trait::async_trait;
 use axum::{
     body::{Body, Bytes},
-    http::{HeaderMap, Request, Response},
+    http::{HeaderMap, Response},
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tracing::{debug, error, warn};
+use tracing::{debug, error};
 
 const SUPPORTED_IMAGE_FORMATS: [&str; 4] = ["image/jpeg", "image/png", "image/gif", "image/webp"];
 const MAX_IMAGE_SIZE: usize = 20_971_520; // 20MB
 const DEFAULT_MODEL: &str = "mistralai/Mixtral-8x7B-Instruct-v0.1";
 
+#[derive(Clone)]
 pub struct TogetherProvider {
     base_url: String,
     http_client: Arc<Client>,
@@ -116,7 +117,6 @@ impl TogetherProvider {
             let content = match msg.get("content") {
                 Some(content_value) if content_value.is_array() => {
                     let mut text_content = String::new();
-                    let mut has_image = false;
 
                     for block in content_value.as_array().unwrap() {
                         match block.get("type").and_then(Value::as_str) {
@@ -315,13 +315,13 @@ impl Provider for TogetherProvider {
         Ok(headers)
     }
 
-    async fn transform_request(&self, mut request: Request<Bytes>) -> Result<Request<Bytes>, AppError> {
-        let body = request.body();
-        if let Ok(json_body) = serde_json::from_slice::<Value>(body) {
+    async fn prepare_request_body(&self, body: Bytes) -> Result<Bytes, AppError> {
+        if let Ok(json_body) = serde_json::from_slice::<Value>(&body) {
             let transformed_body = self.transform_request_body(json_body).await?;
-            *request.body_mut() = Bytes::from(transformed_body.to_string());
+            Ok(Bytes::from(transformed_body.to_string()))
+        } else {
+            Ok(body)
         }
-        Ok(request)
     }
 
     async fn process_response(&self, response: Response<Body>) -> Result<Response<Body>, AppError> {
@@ -330,12 +330,13 @@ impl Provider for TogetherProvider {
             .and_then(|v| v.to_str().ok())
             .map_or(false, |ct| ct.contains("text/event-stream"))
         {
-            let provider = self.clone();
+            let status = response.status();
+            let this = self.clone();
             let stream = response
                 .into_body()
                 .into_data_stream()
                 .map(move |chunk| match chunk {
-                    Ok(bytes) => match provider.transform_streaming_response(bytes) {
+                    Ok(bytes) => match this.transform_streaming_response(bytes) {
                         Ok(transformed) => Ok(transformed),
                         Err(e) => {
                             error!("Error transforming response chunk: {}", e);
@@ -346,7 +347,7 @@ impl Provider for TogetherProvider {
                 });
 
             Ok(Response::builder()
-                .status(response.status())
+                .status(status)
                 .header("content-type", "text/event-stream")
                 .header("cache-control", "no-cache")
                 .header("connection", "keep-alive")

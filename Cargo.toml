@@ -1,3 +1,5 @@
+[workspace]
+
 [package]
 name = "magicapi-ai-gateway"
 version = "0.2.0"
@@ -19,8 +21,6 @@ exclude = [
     "Cargo.toml.orig"
 ]
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [profile.release]
 opt-level = 3
 lto = "fat"
@@ -37,6 +37,8 @@ tracing = { version = "0.1", features = ["attributes"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 reqwest = { version = "0.12.9", features = ["stream", "json", "rustls-tls", "http2", "gzip", "brotli", "stream"], default-features = false }
 http = "1.0"
+http-body = "1.0"
+http-body-util = "0.1"
 bytes = { version = "1.5.0", features = ["serde"] }
 dotenv = "0.15"
 futures-util = { version = "0.3", features = ["io"] }
@@ -46,7 +48,7 @@ thiserror = "2.0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 num_cpus = "1.15"
-aws-sigv4 = "1.2.5"
+aws-sigv4 = "1.2"
 aws-credential-types = "1.2.1"
 chrono = { version = "0.4", features = ["serde"] }
 aws_event_stream_parser = "0.1.2"

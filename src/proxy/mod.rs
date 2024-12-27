@@ -1,178 +1,114 @@
-use crate::providers::Provider;
-use axum::body::to_bytes;
-use axum::{
-    body::{Body, Bytes},
-    http::{HeaderMap, HeaderValue, Request, Response, StatusCode},
+use crate::{
+    config::AppConfig,
+    error::AppError,
+    providers::{
+        anthropic::AnthropicProvider, bedrock::BedrockProvider, fireworks::FireworksProvider,
+        groq::GroqProvider, openai::OpenAIProvider, together::TogetherProvider, Provider,
+    },
 };
-use futures_util::StreamExt;
-use reqwest::Method;
+use axum::{
+    body::Body,
+    extract::State,
+    http::{Request, Response},
+};
+use http_body_util::BodyExt;
 use std::sync::Arc;
 use tracing::{debug, error};
 
-use crate::{config::AppConfig, error::AppError, providers::create_provider};
-
-mod client;
-pub use client::CLIENT;
-mod signing;
-
-pub async fn proxy_request_to_provider(
-    config: Arc<AppConfig>,
-    provider_name: &str,
-    mut original_request: Request<Body>,
+pub async fn proxy_request(
+    state: State<Arc<AppConfig>>,
+    request: Request<Body>,
 ) -> Result<Response<Body>, AppError> {
-    let provider = create_provider(provider_name)?;
-
-    // Extract body bytes
-    let body = std::mem::replace(original_request.body_mut(), Body::empty());
-    let body_bytes = to_bytes(body, usize::MAX)
-        .await
-        .map_err(|e| AppError::AxumError(e.into()))?;
-
-    // Call before_request first to set up any provider state
-    provider
-        .before_request(original_request.headers(), &body_bytes)
-        .await?;
-
-    // Process headers and transform path
-    let headers = provider.process_headers(original_request.headers())?;
-    let path = original_request.uri().path();
-    let modified_path = provider.transform_path(path);
-
-    // Prepare request body
-    let prepared_body = provider.prepare_request_body(body_bytes).await?;
-
-    // Construct final URL
-    let query = original_request
-        .uri()
-        .query()
-        .map(|q| format!("?{}", q))
-        .unwrap_or_default();
-    let url = format!("{}{}{}", provider.base_url(), modified_path, query);
-    debug!("Using URL: {}", url);
-
-    // Handle AWS signing if required
-    let final_headers = if provider.requires_signing() {
-        if let Some((access_key, secret_key, region)) = provider.get_signing_credentials(&headers) {
-            signing::sign_aws_request(
-                original_request.method().as_str(),
-                &url,
-                &prepared_body,
-                &access_key,
-                &secret_key,
-                &region,
-                "bedrock",
-            )
-            .await?
-        } else {
-            headers
-        }
-    } else {
-        headers
-    };
-
-    debug!(
-        "Final headers in proxy_request_to_provider: {:?}",
-        final_headers
-    );
-
-    // Send the request with signed headers
-    let response = send_provider_request(
-        original_request.method().clone(),
-        url,
-        final_headers,
-        prepared_body,
-        &provider,
-        config,
-    )
-    .await?;
-
-    provider.process_response(response).await
-}
-
-pub async fn send_provider_request(
-    method: Method,
-    url: String,
-    headers: HeaderMap,
-    body: Bytes,
-    provider: &Box<dyn Provider>,
-    config: Arc<AppConfig>,
-) -> Result<Response<Body>, AppError> {
-    let client = &*CLIENT;
-
-    let reqwest_headers = headers
-        .iter()
-        .filter_map(|(name, value)| {
-            name.as_str()
-                .parse::<reqwest::header::HeaderName>()
-                .ok()
-                .and_then(|name_str| {
-                    reqwest::header::HeaderValue::from_bytes(value.as_bytes())
-                        .ok()
-                        .map(|v| (name_str, v))
-                })
-        })
-        .collect::<reqwest::header::HeaderMap>();
-
-    debug!(
-        "Final headers in send_provider_request: {:?}",
-        reqwest_headers
-    );
-
-    let response = client
-        .request(method, url)
-        .headers(reqwest_headers)
-        .body(body)
-        .send()
-        .await?;
-
-    process_response(response, config).await
-}
-
-async fn process_response(
-    response: reqwest::Response,
-    config: Arc<AppConfig>,
-) -> Result<Response<Body>, AppError> {
-    let status = StatusCode::from_u16(response.status().as_u16())?;
-    let mut response_builder = Response::builder().status(status);
-
-    // Efficiently copy headers
-    for (name, value) in response.headers() {
-        if let Ok(v) = HeaderValue::from_bytes(value.as_bytes()) {
-            response_builder = response_builder.header(name.clone(), v);
-        }
-    }
-
-    // Fast path for non-streaming responses
-    if !response
+    let provider_name = request
         .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map_or(false, |ct| {
-            ct.contains("application/vnd.amazon.eventstream") || ct.contains("text/event-stream")
-        })
-    {
-        let body = response.bytes().await?;
-        return Ok(response_builder.body(Body::from(body)).unwrap());
+        .get("x-provider")
+        .and_then(|h| h.to_str().ok())
+        .ok_or_else(|| {
+            error!("Missing x-provider header");
+            AppError::InvalidRequestFormat
+        })?;
+
+    let provider = create_provider(provider_name).ok_or_else(|| {
+        error!("Unsupported provider: {}", provider_name);
+        AppError::UnsupportedModel
+    })?;
+
+    let headers = request.headers().clone();
+    let path = request.uri().path().to_string();
+    let method = request.method().clone();
+    let url = format!("{}{}", provider.base_url(), provider.transform_path(&path));
+
+    debug!("Proxying request to: {}", url);
+
+    // Convert the request body to bytes using http_body_util
+    let (_parts, body) = request.into_parts();
+    let bytes = body
+        .collect()
+        .await
+        .map_err(|e| AppError::BodyReadError(e.to_string()))?
+        .to_bytes();
+
+    provider.before_request(&headers, &bytes).await?;
+
+    let processed_headers = provider.process_headers(&headers)?;
+    let processed_body = provider.prepare_request_body(bytes).await?;
+
+    let mut client_request = reqwest::Request::new(
+        method,
+        reqwest::Url::parse(&url).map_err(|e| AppError::RequestError(e.to_string()))?,
+    );
+
+    *client_request.headers_mut() = processed_headers;
+    *client_request.body_mut() = Some(processed_body.to_vec().into());
+
+    if provider.requires_signing() {
+        let body_bytes = processed_body.to_vec();
+        let signed_headers = provider
+            .sign_request(
+                client_request.method().as_str(),
+                &url,
+                client_request.headers(),
+                &body_bytes,
+            )
+            .await?;
+
+        *client_request.headers_mut() = signed_headers;
     }
 
-    // Optimized streaming response handling
-    debug!("Processing streaming response");
+    let client = reqwest::Client::new();
+    let response = client
+        .execute(client_request)
+        .await
+        .map_err(|e| AppError::ProxyError(e.to_string()))?;
 
-    let stream = response.bytes_stream().map(|result| match result {
-        Ok(bytes) => Ok(bytes),
-        Err(e) => {
-            error!("Stream error: {}", e);
-            Err(std::io::Error::new(std::io::ErrorKind::Other, e))
-        }
-    });
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = response.bytes().await.map_err(|e| {
+        error!("Failed to read response body: {}", e);
+        AppError::BodyReadError(e.to_string())
+    })?;
 
-    // Add streaming headers once
-    response_builder = response_builder
-        .header("content-type", "text/event-stream")
-        .header("cache-control", "no-cache")
-        .header("connection", "keep-alive")
-        .header("transfer-encoding", "chunked")
-        .header("x-accel-buffering", "no");
+    let mut response = Response::builder().status(status);
+    for (key, value) in headers.iter() {
+        response = response.header(key, value);
+    }
 
-    Ok(response_builder.body(Body::from_stream(stream)).unwrap())
+    Ok(response.body(Body::from(body)).unwrap())
+}
+
+pub fn create_provider(name: &str) -> Option<Box<dyn Provider>> {
+    match name {
+        "openai" => Some(Box::new(OpenAIProvider::new())),
+        "anthropic" => Some(Box::new(AnthropicProvider::new())),
+        "bedrock" => Some(Box::new(BedrockProvider::new())),
+        "fireworks" => Some(Box::new(FireworksProvider::new())),
+        "groq" => Some(Box::new(GroqProvider::new())),
+        "together" => Some(Box::new(TogetherProvider::new())),
+        _ => None,
+    }
+}
+
+pub async fn initialize_proxy(_config: Arc<AppConfig>) -> Result<(), AppError> {
+    // Proxy initialization logic here if needed
+    Ok(())
 }

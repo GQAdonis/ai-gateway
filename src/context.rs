@@ -1,13 +1,15 @@
 use axum::http::HeaderMap;
 use serde_json::Value;
 
-#[derive(Debug, Clone)]
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
 pub struct RequestContext {
     pub model: String,
     pub request_body: Value,
     pub headers: HeaderMap,
 }
 
+#[allow(dead_code)]
 impl RequestContext {
     pub fn new(model: String, request_body: Value, headers: HeaderMap) -> Self {
         Self {

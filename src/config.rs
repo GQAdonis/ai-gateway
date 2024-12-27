@@ -1,71 +1,55 @@
-use num_cpus;
 use std::env;
-use tracing::debug;
-use tracing::info;
 
+#[derive(Debug, Clone)]
 pub struct AppConfig {
     pub port: u16,
     pub host: String,
-    pub worker_threads: usize,
+    pub workers: usize,
     pub max_connections: usize,
-    pub tcp_keepalive_interval: u64,
-    pub tcp_nodelay: bool,
-    pub buffer_size: usize,
+    pub keep_alive: u64,
+    pub request_timeout: u64,
+    pub response_timeout: u64,
+    pub max_request_size: usize,
 }
 
 impl AppConfig {
     pub fn new() -> Self {
-        info!("Loading environment configuration");
-        dotenv::dotenv().ok();
+        Self::default()
+    }
+}
 
-        // Optimize thread count based on CPU cores
-        let cpu_count = num_cpus::get();
-        debug!("Detected {} CPU cores", cpu_count);
-
-        let default_workers = if cpu_count <= 4 {
-            cpu_count * 2
-        } else {
-            cpu_count + 4
-        };
-        debug!("Calculated default worker threads: {}", default_workers);
-
-        let config = Self {
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
             port: env::var("PORT")
-                .unwrap_or_else(|_| "3000".to_string())
-                .parse()
-                .expect("PORT must be a number"),
-            host: env::var("HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
-            worker_threads: env::var("WORKER_THREADS")
                 .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(default_workers),
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(3000),
+            host: env::var("HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
+            workers: env::var("WORKERS")
+                .ok()
+                .and_then(|w| w.parse().ok())
+                .unwrap_or_else(num_cpus::get),
             max_connections: env::var("MAX_CONNECTIONS")
                 .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(10_000),
-            tcp_keepalive_interval: env::var("TCP_KEEPALIVE_INTERVAL")
+                .and_then(|c| c.parse().ok())
+                .unwrap_or(25_000),
+            keep_alive: env::var("KEEP_ALIVE")
                 .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(30),
-            tcp_nodelay: env::var("TCP_NODELAY")
+                .and_then(|k| k.parse().ok())
+                .unwrap_or(90),
+            request_timeout: env::var("REQUEST_TIMEOUT")
                 .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(true),
-            buffer_size: env::var("BUFFER_SIZE")
+                .and_then(|t| t.parse().ok())
+                .unwrap_or(60),
+            response_timeout: env::var("RESPONSE_TIMEOUT")
                 .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(8 * 1024), // 8KB default
-        };
-
-        info!(
-            "Configuration loaded: port={}, host={}",
-            config.port, config.host
-        );
-        debug!(
-            "Advanced settings: workers={}, max_conn={}, buffer_size={}",
-            config.worker_threads, config.max_connections, config.buffer_size
-        );
-
-        config
+                .and_then(|t| t.parse().ok())
+                .unwrap_or(60),
+            max_request_size: env::var("MAX_REQUEST_SIZE")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(5_242_880), // 5MB
+        }
     }
 }

@@ -1,11 +1,15 @@
+use crate::config::AppConfig;
 use axum::{
-    routing::{any, get},
+    routing::{get, post},
     Router,
 };
-use std::sync::Arc;
-use std::time::Duration;
-use tower_http::cors::{Any, CorsLayer};
-use tracing::{debug, error, info};
+use std::{net::SocketAddr, sync::Arc};
+use tokio::net::TcpListener;
+use tower_http::{
+    compression::CompressionLayer,
+    cors::{Any, CorsLayer},
+};
+use tracing::{debug, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod config;
@@ -15,95 +19,55 @@ mod handlers;
 mod providers;
 mod proxy;
 
-use crate::config::AppConfig;
-
 #[tokio::main]
 async fn main() {
     // Initialize tracing
-    info!("Initializing tracing system");
     tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::new(
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
-        ))
-        .with(tracing_subscriber::fmt::layer().compact())
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "magicapi_ai_gateway=debug,tower_http=debug".into()),
+        )
+        .with(tracing_subscriber::fmt::layer())
         .init();
 
     // Load configuration
-    info!("Loading application configuration");
     let config = Arc::new(AppConfig::new());
-    debug!(
-        "Configuration loaded: port={}, host={}",
-        config.port, config.host
-    );
 
-    // Optimize tokio runtime
-    info!(
-        "Configuring tokio runtime with {} worker threads",
-        config.worker_threads
-    );
-    std::env::set_var("TOKIO_WORKER_THREADS", config.worker_threads.to_string());
-    std::env::set_var("TOKIO_THREAD_STACK_SIZE", (2 * 1024 * 1024).to_string());
+    // Initialize the proxy
+    proxy::initialize_proxy(config.clone())
+        .await
+        .expect("Failed to initialize proxy");
 
-    // Setup CORS
-    debug!("Setting up CORS layer with 1-hour max age");
+    // Set up CORS
     let cors = CorsLayer::new()
-        .allow_origin(Any)
         .allow_methods(Any)
         .allow_headers(Any)
-        .max_age(Duration::from_secs(3600));
+        .allow_origin(Any);
 
-    // Create router with optimized settings
+    // Build the router
     let app = Router::new()
         .route("/health", get(handlers::health_check))
-        .route("/v1/*path", any(handlers::proxy_request))
-        .with_state(config.clone())
+        .route("/v1/*path", post(handlers::handle_request))
         .layer(cors)
-        .into_make_service_with_connect_info::<std::net::SocketAddr>();
+        .layer(CompressionLayer::new())
+        .with_state(config.clone());
 
-    // Start server with optimized TCP settings
-    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], config.port));
-    info!("Setting up TCP listener with non-blocking mode");
-    let tcp_listener = std::net::TcpListener::bind(addr).expect("Failed to bind address");
-    tcp_listener
-        .set_nonblocking(true)
-        .expect("Failed to set non-blocking");
-
-    debug!("Converting to tokio TCP listener");
-    let listener = tokio::net::TcpListener::from_std(tcp_listener)
-        .expect("Failed to create Tokio TCP listener");
+    // Get the bind address
+    let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
 
     info!(
-        "AI Gateway listening on {}:{} with {} worker threads",
-        config.host, config.port, config.worker_threads
+        "Starting server with {} workers",
+        config.workers
     );
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .unwrap_or_else(|e| {
-            error!("Server error: {}", e);
-            std::process::exit(1);
-        });
-}
+    debug!(
+        "Listening on {}:{} with {} workers",
+        config.host,
+        config.port,
+        config.workers
+    );
 
-async fn shutdown_signal() {
-    info!("Registering shutdown signal handler");
-    let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("Failed to install CTRL+C signal handler")
-    };
-
-    let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("Failed to install signal handler")
-            .recv()
-            .await;
-    };
-
-    tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
-    }
-    info!("Shutdown signal received, starting graceful shutdown");
+    // Start the server
+    let listener = TcpListener::bind(&addr).await.unwrap();
+    axum::serve(listener, app).await.unwrap();
 }
