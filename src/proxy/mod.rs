@@ -2,8 +2,9 @@ use crate::{
     config::AppConfig,
     error::AppError,
     providers::{
-        anthropic::AnthropicProvider, bedrock::BedrockProvider, fireworks::FireworksProvider,
-        groq::GroqProvider, openai::OpenAIProvider, together::TogetherProvider, Provider,
+        anthropic::AnthropicProvider, bedrock::BedrockProvider, dify::DifyProvider,
+        fireworks::FireworksProvider, groq::GroqProvider, openai::OpenAIProvider,
+        together::TogetherProvider, Provider,
     },
 };
 use axum::{
@@ -36,7 +37,11 @@ pub async fn proxy_request(
     let headers = request.headers().clone();
     let path = request.uri().path().to_string();
     let method = request.method().clone();
-    let url = format!("{}{}", provider.base_url(), provider.transform_path(&path));
+    let url = format!(
+        "{}{}",
+        provider.base_url(),
+        provider.transform_path_with_headers(&path, &headers)
+    );
 
     debug!("Proxying request to: {}", url);
 
@@ -83,17 +88,14 @@ pub async fn proxy_request(
 
     let status = response.status();
     let headers = response.headers().clone();
-    let body = response.bytes().await.map_err(|e| {
-        error!("Failed to read response body: {}", e);
-        AppError::BodyReadError(e.to_string())
-    })?;
 
-    let mut response = Response::builder().status(status);
+    let mut builder = Response::builder().status(status);
     for (key, value) in headers.iter() {
-        response = response.header(key, value);
+        builder = builder.header(key, value);
     }
 
-    Ok(response.body(Body::from(body)).unwrap())
+    let response = builder.body(Body::from_stream(response.bytes_stream())).unwrap();
+    provider.process_response(response).await
 }
 
 pub fn create_provider(name: &str) -> Option<Box<dyn Provider>> {
@@ -104,6 +106,7 @@ pub fn create_provider(name: &str) -> Option<Box<dyn Provider>> {
         "fireworks" => Some(Box::new(FireworksProvider::new())),
         "groq" => Some(Box::new(GroqProvider::new())),
         "together" => Some(Box::new(TogetherProvider::new())),
+        "dify" => Some(Box::new(DifyProvider::new())),
         _ => None,
     }
 }

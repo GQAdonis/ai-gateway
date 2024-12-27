@@ -42,6 +42,11 @@ pub trait Provider: Send + Sync {
         path.to_string()
     }
 
+    #[allow(unused_variables)]
+    fn transform_path_with_headers(&self, path: &str, headers: &HeaderMap) -> String {
+        self.transform_path(path)
+    }
+
     fn requires_signing(&self) -> bool {
         false
     }
