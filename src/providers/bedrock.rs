@@ -2,30 +2,39 @@ use super::Provider;
 use crate::error::AppError;
 use async_trait::async_trait;
 use aws_event_stream_parser::{parse_message, Message};
+use aws_sigv4::http_request::{sign, SigningSettings, SigningParams};
+use aws_sigv4::sign::v4;
 use axum::{
     body::{Body, Bytes},
     http::{HeaderMap, HeaderValue, Response, StatusCode},
 };
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use futures_util::StreamExt;
+use http::Request;
 use parking_lot::RwLock;
+use reqwest::Client;
 use serde_json::{json, Value};
 use std::sync::Arc;
+use time::OffsetDateTime;
 use tracing::{debug, error, warn};
 
-/// Constants for default values
 const DEFAULT_REGION: &str = "us-east-1";
-const DEFAULT_MODEL: &str = "amazon.titan-text-premier-v1:0";
-const DEFAULT_FALLBACK_MODEL: &str = "mistral.mistral-7b-instruct-v0:2";
+const DEFAULT_MODEL: &str = "amazon.titan-text-express-v1";
+const DEFAULT_FALLBACK_MODEL: &str = "anthropic.claude-v2";
 const DEFAULT_MAX_TOKENS: u64 = 1000;
 const DEFAULT_TEMPERATURE: f64 = 0.7;
 const DEFAULT_TOP_P: f64 = 1.0;
+const MAX_IMAGE_SIZE: usize = 5_242_880; // 5MB
+const SUPPORTED_IMAGE_FORMATS: [&str; 4] = ["image/jpeg", "image/png", "image/gif", "image/webp"];
+const MAX_TOOL_CALLS: usize = 15;
+const SUPPORTED_TOOL_TYPES: [&str; 1] = ["function"];
 
-/// BedrockProvider handles AWS Bedrock API integration
 #[derive(Clone)]
 pub struct BedrockProvider {
     base_url: Arc<RwLock<String>>,
     region: Arc<RwLock<String>>,
     current_model: Arc<RwLock<String>>,
+    http_client: Arc<Client>,
 }
 
 impl BedrockProvider {
@@ -40,6 +49,93 @@ impl BedrockProvider {
             ))),
             region: Arc::new(RwLock::new(region)),
             current_model: Arc::new(RwLock::new(DEFAULT_MODEL.to_string())),
+            http_client: Arc::new(Client::new()),
+        }
+    }
+
+    async fn validate_image(&self, url: &str) -> Result<bool, AppError> {
+        let response = self.http_client.head(url).send().await.map_err(|e| {
+            AppError::ValidationError(format!("Failed to validate image URL: {}", e))
+        })?;
+
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+
+        let content_length = response
+            .headers()
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+
+        if !SUPPORTED_IMAGE_FORMATS.iter().any(|&f| content_type.contains(f)) {
+            return Err(AppError::ValidationError(format!(
+                "Unsupported image format: {}",
+                content_type
+            )));
+        }
+
+        if content_length > MAX_IMAGE_SIZE {
+            return Err(AppError::ValidationError(format!(
+                "Image size {} exceeds maximum limit of {} bytes",
+                content_length, MAX_IMAGE_SIZE
+            )));
+        }
+
+        Ok(true)
+    }
+
+    async fn process_image_content(&self, url: &str) -> Result<String, AppError> {
+        self.validate_image(url).await?;
+
+        let response = self.http_client.get(url).send().await.map_err(|e| {
+            AppError::ProcessingError(format!("Failed to fetch image: {}", e))
+        })?;
+
+        let image_bytes = response.bytes().await.map_err(|e| {
+            AppError::ProcessingError(format!("Failed to read image bytes: {}", e))
+        })?;
+
+        Ok(BASE64.encode(image_bytes))
+    }
+
+    fn transform_tool_calls(&self, content: &Value) -> Result<Value, AppError> {
+        if let Some(tool_calls) = content.get("tool_calls") {
+            let transformed_calls = tool_calls
+                .as_array()
+                .ok_or_else(|| AppError::InvalidRequestFormat)?
+                .iter()
+                .take(MAX_TOOL_CALLS)
+                .filter_map(|call| {
+                    let call_type = call.get("type")?.as_str()?;
+                    if !SUPPORTED_TOOL_TYPES.contains(&call_type) {
+                        return None;
+                    }
+
+                    let function = call.get("function")?;
+                    Some(json!({
+                        "type": "function",
+                        "function": {
+                            "name": function.get("name")?.as_str()?,
+                            "arguments": function.get("arguments")?.as_str()?
+                        }
+                    }))
+                })
+                .collect::<Vec<_>>();
+
+            if transformed_calls.is_empty() {
+                return Ok(json!({"type": "text", "text": ""}));
+            }
+
+            Ok(json!({
+                "type": "tool_calls",
+                "tool_calls": transformed_calls
+            }))
+        } else {
+            Ok(content.clone())
         }
     }
 
@@ -53,7 +149,6 @@ impl BedrockProvider {
     fn transform_request_body(&self, body: Value) -> Result<Value, AppError> {
         debug!("Transforming request body: {:#?}", body);
 
-        // Return early if already in correct format
         if body.get("inferenceConfig").is_some() {
             return Ok(body);
         }
@@ -66,16 +161,77 @@ impl BedrockProvider {
                 AppError::InvalidRequestFormat
             })?;
 
-        let transformed_messages = messages
-            .iter()
-            .map(|msg| {
-                let content = msg["content"].as_str().unwrap_or_default();
-                json!({
-                    "role": msg["role"].as_str().unwrap_or("user"),
-                    "content": [{ "text": content }]
-                })
-            })
-            .collect::<Vec<_>>();
+        let mut transformed_messages = Vec::new();
+        for msg in messages {
+            let role = msg["role"].as_str().unwrap_or("user");
+            let content = msg.get("content");
+
+            let transformed_content = match content {
+                Some(content_value) => {
+                    if content_value.is_array() {
+                        content_value
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|block| {
+                                match block.get("type").and_then(Value::as_str) {
+                                    Some("text") => json!({
+                                        "type": "text",
+                                        "text": block.get("text").and_then(Value::as_str).unwrap_or_default()
+                                    }),
+                                    Some("image_url") => {
+                                        if let Some(url) = block
+                                            .get("image_url")
+                                            .and_then(|u| u.get("url"))
+                                            .and_then(Value::as_str)
+                                        {
+                                            let media_type = block
+                                                .get("image_url")
+                                                .and_then(|u| u.get("detail"))
+                                                .and_then(Value::as_str)
+                                                .unwrap_or("auto");
+                                            
+                                            match self.process_image_content(url) {
+                                                Ok(base64_data) => json!({
+                                                    "type": "image",
+                                                    "source": {
+                                                        "type": "base64",
+                                                        "media_type": media_type,
+                                                        "data": base64_data
+                                                    }
+                                                }),
+                                                Err(e) => {
+                                                    error!("Failed to process image content: {}", e);
+                                                    json!({"type": "text", "text": ""})
+                                                }
+                                            }
+                                        } else {
+                                            json!({"type": "text", "text": ""})
+                                        }
+                                    }
+                                    Some("tool_call") => self.transform_tool_calls(block)
+                                        .unwrap_or_else(|_| json!({"type": "text", "text": ""})),
+                                    _ => json!({"type": "text", "text": ""})
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                    } else if content_value.is_string() {
+                        vec![json!({
+                            "type": "text",
+                            "text": content_value.as_str().unwrap_or_default()
+                        })]
+                    } else {
+                        vec![json!({"type": "text", "text": ""})]
+                    }
+                }
+                None => vec![json!({"type": "text", "text": ""})],
+            };
+
+            transformed_messages.push(json!({
+                "role": role,
+                "content": transformed_content
+            }));
+        }
 
         let transformed = json!({
             "messages": transformed_messages,
@@ -154,12 +310,14 @@ impl BedrockProvider {
         let body_str = String::from_utf8(message.body.to_vec())?;
         let json: Value = serde_json::from_str(&body_str)?;
 
-        if let Some(delta) = json
-            .get("delta")
-            .and_then(|d| d.get("text"))
-            .and_then(Value::as_str)
-        {
-            let response = self.create_delta_response(delta);
+        if let Some(delta) = json.get("delta") {
+            let response = if let Some(tool_calls) = delta.get("tool_calls") {
+                self.create_tool_call_response(tool_calls)
+            } else if let Some(text) = delta.get("text").and_then(Value::as_str) {
+                self.create_delta_response(text)
+            } else {
+                return Ok(vec![]);
+            };
             Ok(vec![format!("data: {}\n\n", response.to_string())])
         } else {
             Ok(vec![])
@@ -197,6 +355,22 @@ impl BedrockProvider {
         })
     }
 
+    fn create_tool_call_response(&self, tool_calls: &Value) -> Value {
+        json!({
+            "id": "chatcmpl-bedrock",
+            "object": "chat.completion.chunk",
+            "created": chrono::Utc::now().timestamp(),
+            "model": self.current_model.read().as_str(),
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": tool_calls
+                },
+                "finish_reason": null
+            }]
+        })
+    }
+
     fn create_final_response(&self, usage: &Value) -> Value {
         json!({
             "id": "chatcmpl-bedrock",
@@ -211,6 +385,33 @@ impl BedrockProvider {
             "usage": usage
         })
     }
+
+    async fn sign_request(&self, mut request: Request<Bytes>, credentials: (String, String, String)) -> Result<Request<Bytes>, AppError> {
+        let (access_key, secret_key, region) = credentials;
+        
+        let signing_settings = SigningSettings::default();
+        let signing_params = SigningParams::builder()
+            .access_key(access_key)
+            .secret_key(secret_key)
+            .region(region)
+            .service_name("bedrock")
+            .time(OffsetDateTime::now_utc())
+            .settings(signing_settings)
+            .build()
+            .map_err(|e| AppError::SigningError(e.to_string()))?;
+
+        let (signing_instructions, _signature) = v4::sign(request.clone(), &signing_params)
+            .map_err(|e| AppError::SigningError(e.to_string()))?;
+
+        for (key, value) in signing_instructions.headers {
+            request.headers_mut().insert(
+                key.clone(),
+                HeaderValue::from_str(&value).map_err(|e| AppError::SigningError(e.to_string()))?,
+            );
+        }
+
+        Ok(request)
+    }
 }
 
 #[async_trait]
@@ -224,7 +425,6 @@ impl Provider for BedrockProvider {
     }
 
     async fn before_request(&self, headers: &HeaderMap, body: &Bytes) -> Result<(), AppError> {
-        // Extract and set the model from the request body before any other processing
         if let Ok(request_body) = serde_json::from_slice::<Value>(body) {
             if let Some(model) = request_body["model"].as_str() {
                 debug!("Setting model from before_request: {}", model);
@@ -232,7 +432,6 @@ impl Provider for BedrockProvider {
             }
         }
 
-        // Extract and set the region from the request headers
         if let Some(region) = headers.get("x-aws-region").and_then(|h| h.to_str().ok()) {
             debug!("Setting region from before_request: {}", region);
             *self.region.write() = region.to_string();
@@ -243,34 +442,12 @@ impl Provider for BedrockProvider {
     }
 
     fn transform_path(&self, path: &str) -> String {
-        let model = self.current_model.read();
-        debug!("Transforming path with model: {}", *model);
-        format!("/model/{}/converse-stream", *model)
-    }
-
-    async fn prepare_request_body(&self, body: Bytes) -> Result<Bytes, AppError> {
-        let request_body: Value = serde_json::from_slice(&body)?;
-        let transformed_body = self.transform_request_body(request_body)?;
-        Ok(Bytes::from(serde_json::to_vec(&transformed_body)?))
-    }
-
-    fn process_headers(&self, headers: &HeaderMap) -> Result<HeaderMap, AppError> {
-        let mut final_headers = HeaderMap::new();
-
-        // Add standard headers
-        final_headers.insert(
-            http::header::CONTENT_TYPE,
-            http::header::HeaderValue::from_static("application/json"),
-        );
-
-        // Preserve AWS specific headers
-        for (key, value) in headers {
-            if key.as_str().starts_with("x-aws-") {
-                final_headers.insert(key.clone(), value.clone());
-            }
+        if path.contains("/chat/completions") {
+            let model = self.current_model.read();
+            format!("/model/{}/invoke", model)
+        } else {
+            path.to_string()
         }
-
-        Ok(final_headers)
     }
 
     fn requires_signing(&self) -> bool {
@@ -294,18 +471,24 @@ impl Provider for BedrockProvider {
         format!("bedrock-runtime.{}.amazonaws.com", region)
     }
 
+    async fn transform_request(&self, mut request: Request<Bytes>) -> Result<Request<Bytes>, AppError> {
+        let body = request.body();
+        if let Ok(json_body) = serde_json::from_slice::<Value>(body) {
+            let transformed_body = self.transform_request_body(json_body)?;
+            *request.body_mut() = Bytes::from(transformed_body.to_string());
+        }
+        Ok(request)
+    }
+
     async fn process_response(&self, response: Response<Body>) -> Result<Response<Body>, AppError> {
         if response
             .headers()
             .get(http::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
-            .map_or(false, |ct| {
-                ct.contains("application/vnd.amazon.eventstream")
-            })
+            .map_or(false, |ct| ct.contains("application/vnd.amazon.eventstream"))
         {
             debug!("Processing Bedrock event stream response");
 
-            // Create transformed stream
             let provider = self.clone();
             let stream = response
                 .into_body()
@@ -321,26 +504,24 @@ impl Provider for BedrockProvider {
                     Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
                 });
 
-            // Build response with transformed stream and all necessary headers
             Ok(Response::builder()
                 .status(StatusCode::OK)
-                // SSE specific headers
                 .header("content-type", "text/event-stream")
                 .header("cache-control", "no-cache")
                 .header("connection", "keep-alive")
                 .header("transfer-encoding", "chunked")
-                // CORS headers
                 .header("access-control-allow-origin", "*")
                 .header("access-control-allow-methods", "POST, OPTIONS")
-                .header("access-control-allow-headers", "content-type, x-provider, x-aws-access-key-id, x-aws-secret-access-key, x-aws-region")
+                .header(
+                    "access-control-allow-headers",
+                    "content-type, x-provider, x-aws-access-key-id, x-aws-secret-access-key, x-aws-region"
+                )
                 .header("access-control-expose-headers", "*")
-                // SSE specific headers for better client compatibility
                 .header("x-accel-buffering", "no")
                 .header("keep-alive", "timeout=600")
                 .body(Body::from_stream(stream))
                 .unwrap())
         } else {
-            // For non-streaming responses, still add CORS headers
             let mut response = response;
             let headers = response.headers_mut();
             headers.insert("access-control-allow-origin", HeaderValue::from_static("*"));
@@ -348,8 +529,12 @@ impl Provider for BedrockProvider {
                 "access-control-allow-methods",
                 HeaderValue::from_static("POST, OPTIONS"),
             );
-            headers.insert("access-control-allow-headers",
-                           HeaderValue::from_static("content-type, x-provider, x-aws-access-key-id, x-aws-secret-access-key, x-aws-region"));
+            headers.insert(
+                "access-control-allow-headers",
+                HeaderValue::from_static(
+                    "content-type, x-provider, x-aws-access-key-id, x-aws-secret-access-key, x-aws-region"
+                ),
+            );
             headers.insert(
                 "access-control-expose-headers",
                 HeaderValue::from_static("*"),
