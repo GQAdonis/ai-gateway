@@ -283,7 +283,10 @@ impl DifyProvider {
                             "delta": {
                                 "content": json.get("answer").and_then(Value::as_str).unwrap_or("")
                             },
-                            "finish_reason": json.get("finish_reason").and_then(Value::as_str).unwrap_or(null)
+                            "finish_reason": match json.get("finish_reason").and_then(Value::as_str) {
+                                Some(reason) => Value::String(reason.to_string()),
+                                None => Value::Null
+                            }
                         }]
                     });
                     transformed_lines.push(format!("data: {}", transformed.to_string()));
@@ -367,7 +370,10 @@ impl Provider for DifyProvider {
 
     async fn prepare_request_body(&self, body: Bytes) -> Result<Bytes, AppError> {
         if let Ok(json_body) = serde_json::from_slice::<Value>(&body) {
-            let transformed_body = self.transform_request_body(json_body).await?;
+            // Create empty headers since we don't have access to them here
+            // Headers will be properly processed in process_headers
+            let headers = HeaderMap::new();
+            let transformed_body = self.transform_request_body(json_body, &headers).await?;
             Ok(Bytes::from(transformed_body.to_string()))
         } else {
             Ok(body)

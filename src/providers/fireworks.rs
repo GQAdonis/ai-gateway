@@ -3,7 +3,7 @@ use crate::error::AppError;
 use async_trait::async_trait;
 use axum::{
     body::{Body, Bytes},
-    http::{HeaderMap, HeaderValue, Response, StatusCode},
+    http::{HeaderMap, HeaderValue, Response},
 };
 use parking_lot::RwLock;
 use reqwest::Client;

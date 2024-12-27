@@ -17,7 +17,7 @@ use std::sync::Arc;
 use tracing::{debug, error};
 
 pub async fn proxy_request(
-    state: State<Arc<AppConfig>>,
+    _state: State<Arc<AppConfig>>,
     request: Request<Body>,
 ) -> Result<Response<Body>, AppError> {
     let provider_name = request

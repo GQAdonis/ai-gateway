@@ -1,5 +1,6 @@
 pub mod anthropic;
 pub mod bedrock;
+pub mod dify;
 pub mod fireworks;
 pub mod groq;
 pub mod openai;
